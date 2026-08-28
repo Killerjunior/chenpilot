@@ -236,7 +236,8 @@ Output JSON format:
   }
 
   /**
-   * Create a hashed plan with integrity verification
+   * Create a hashed plan with integrity verification.
+   * The plan signing key is consumed via SecretBuffer for minimal retention.
    */
   private createHashedPlan(plan: ExecutionPlan): HashedPlan {
     // Generate hash for the plan
