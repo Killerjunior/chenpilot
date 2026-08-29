@@ -357,14 +357,26 @@ export class SwapTool extends BaseTool<SwapPayload> {
 
       const result = await this.server.submitTransaction(transaction);
 
-      // Confirmed
+      // Submitted - start reorg-aware finality tracking instead of immediately confirming
       await transactionLifecycleService.transition(lifecycleId, "submitted", {
         correlationId: result.hash,
         metadata: { txHash: result.hash, ledger: result.ledger },
       });
-      await transactionLifecycleService.transition(lifecycleId, "confirmed", {
-        metadata: { successful: result.successful },
-      });
+
+      // Start reorg-aware finality tracking (does NOT immediately trigger confirmation events)
+      const { getFinalizationManager } = await import("../services/finality/FinalizationManager");
+      const finalizationManager = getFinalizationManager();
+      await finalizationManager.startTracking(
+        lifecycleId,
+        result.hash,
+        result.ledger,
+        result.ledger_attr?.hash || "",
+        config.stellar.horizonUrl
+      );
+
+      // NOTE: Balance updates and confirmation events will be triggered when finality is declared
+      // (finality_status = FINAL), not here. The finalizationManager will emit finality:declared
+      // event which consuming services should listen to.
 
       return this.createSuccessResult("swap", {
         from: payload.from,
