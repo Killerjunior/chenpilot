@@ -458,6 +458,7 @@ export class ParallelScheduler {
       where: { execution: { id: executionId } },
     });
 
+    const now = new Date();
     const toCancelEntities = steps.filter(
       (s) =>
         toCancel.has(s.stepNumber) &&
@@ -467,6 +468,7 @@ export class ParallelScheduler {
 
     for (const s of toCancelEntities) {
       s.status = StepStatus.CANCELLED;
+      s.cancelledAt = now;
     }
 
     if (toCancelEntities.length > 0) {

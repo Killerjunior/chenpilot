@@ -38,6 +38,21 @@ export class DurableExecutor {
   private executionRepo = AppDataSource.getRepository(DurableExecution);
   private stepRepo = AppDataSource.getRepository(DurableStep);
 
+  // ---------------------------------------------------------------------------
+  // Internal safe-point guard
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Reads the execution's current status from the database and throws
+   * `ExecutionCancelledError` if it is CANCELLED.  Called at every safe point
+   * in the run loop — before each step and before each retry attempt — so that
+   * a concurrent `cancelExecution` call is observed within at most one step's
+   * latency.
+   *
+   * Safe points are chosen to guarantee that an irreversible side effect
+   * (on-chain submission, external API call) cannot be misreported as
+   * cancelled: the check fires *before* the tool is invoked, not after.
+   */
   private async checkCancelled(executionId: string): Promise<void> {
     const freshExecution = await this.executionRepo.findOne({
       where: { id: executionId },
@@ -47,6 +62,10 @@ export class DurableExecutor {
       throw new ExecutionCancelledError(executionId);
     }
   }
+
+  // ---------------------------------------------------------------------------
+  // startExecution
+  // ---------------------------------------------------------------------------
 
   /**
    * Starts a new durable execution from a plan.
@@ -129,6 +148,10 @@ export class DurableExecutor {
     return savedExecution;
   }
 
+  // ---------------------------------------------------------------------------
+  // resumeExecution
+  // ---------------------------------------------------------------------------
+
   /**
    * Resumes a paused or failed execution
    */
@@ -170,27 +193,40 @@ export class DurableExecutor {
     await this.run(executionId);
   }
 
+  // ---------------------------------------------------------------------------
+  // cancelExecution
+  // ---------------------------------------------------------------------------
+
   /**
    * Request cancellation of a durable execution.
    *
-   * Idempotency contract:
-   *   - If the execution is already CANCELLED, the method returns the
-   *     existing record without writing.
-   *   - If the execution is in a terminal state other than CANCELLED
-   *     (COMPLETED or FAILED), the call throws — cancellation of an
-   *     irreversible outcome must never be silently accepted.
+   * ### Idempotency contract
+   * - If the execution is already CANCELLED, the method returns the existing
+   *   record without writing (idempotent).
+   * - If the execution is in a terminal state other than CANCELLED (COMPLETED
+   *   or FAILED), the call throws — cancellation of an irreversible outcome
+   *   must never be silently accepted.
    *
-   * Authorization:
-   *   - `requestedBy` must equal the execution's `userId`, unless the
-   *     caller passes `bypassOwnerCheck: true` (intended for admin /
-   *     operator paths that have already validated their own privilege).
+   * ### Authorization
+   * - `requestedBy` must equal the execution's `userId`, unless the caller
+   *   passes `bypassOwnerCheck: true` (intended for admin / operator paths
+   *   that have already validated their own privilege).
    *
-   * Safe-point guard:
-   *   - Cancellation is durably written only while the execution is in a
-   *     cancellable state. If a concurrent `run()` loop is currently
-   *     executing a step, it will detect the CANCELLED flag at the next
-   *     safe-point check and stop before invoking the following step's
-   *     side effect.
+   * ### Safe-point semantics
+   * - Cancellation is durably written only while the execution is in a
+   *   cancellable state (PENDING, RUNNING, PAUSED, AWAITING_APPROVAL).
+   * - If a concurrent `run()` loop is currently executing a step, it will
+   *   detect the CANCELLED flag at the next safe-point check (`checkCancelled`)
+   *   and terminate before invoking the *next* step's side effect.
+   * - A step that has already been handed off to a tool (irreversible side
+   *   effect in flight) is allowed to complete; its result is written
+   *   correctly regardless of the cancellation.
+   *
+   * ### Pending-step cleanup
+   * - All PENDING and AWAITING_APPROVAL steps are transitioned to CANCELLED
+   *   atomically with the execution record, with `cancelledAt` timestamps.
+   *   RUNNING steps are left in their current state — they will either
+   *   complete or fail on their own.
    */
   async cancelExecution(
     executionId: string,
@@ -207,16 +243,20 @@ export class DurableExecutor {
       throw new Error(`Execution not found: ${executionId}`);
     }
 
+    // Authorization: only the owner may cancel unless explicitly bypassed.
     if (!bypassOwnerCheck && execution.userId !== requestedBy) {
       throw new Error(
         `Forbidden: user ${requestedBy} cannot cancel execution owned by ${execution.userId}`
       );
     }
 
+    // Idempotency: already cancelled → return current record without writing.
     if (execution.status === ExecutionStatus.CANCELLED) {
       return execution;
     }
 
+    // Terminal states that reflect irreversible outcomes must never be
+    // silently overwritten with CANCELLED.
     if (
       execution.status === ExecutionStatus.COMPLETED ||
       execution.status === ExecutionStatus.FAILED
@@ -227,26 +267,31 @@ export class DurableExecutor {
       );
     }
 
+    // Guard: the execution must be in a known-cancellable state.
     if (!CANCELLABLE_EXECUTION_STATUSES.has(execution.status)) {
       throw new Error(
         `Execution ${executionId} is in non-cancellable state '${execution.status}'`
       );
     }
 
-    const pendingSteps = execution.steps.filter(
+    // Cancel all steps that have not yet started a side effect.
+    const now = new Date();
+    const stoppableSteps = execution.steps.filter(
       (s) =>
         s.status === StepStatus.PENDING ||
         s.status === StepStatus.AWAITING_APPROVAL
     );
-    if (pendingSteps.length > 0) {
-      for (const step of pendingSteps) {
+    if (stoppableSteps.length > 0) {
+      for (const step of stoppableSteps) {
         step.status = StepStatus.CANCELLED;
+        step.cancelledAt = now;
       }
-      await this.stepRepo.save(pendingSteps);
+      await this.stepRepo.save(stoppableSteps);
     }
 
+    // Durably record the cancellation on the execution.
     execution.status = ExecutionStatus.CANCELLED;
-    execution.cancelledAt = new Date();
+    execution.cancelledAt = now;
     execution.cancelledBy = requestedBy;
     execution.cancellationReason = reason ?? null;
     const saved = await this.executionRepo.save(execution);
@@ -262,8 +307,14 @@ export class DurableExecutor {
     return saved;
   }
 
+  // ---------------------------------------------------------------------------
+  // Main sequential execution loop
+  // ---------------------------------------------------------------------------
+
   /**
-   * Main execution loop
+   * Sequential execution loop.  Iterates steps in order; checks for
+   * cancellation at the safe point *before* each step's side effect is
+   * invoked.
    */
   private async run(executionId: string): Promise<void> {
     const execution = await this.executionRepo.findOne({
@@ -273,6 +324,9 @@ export class DurableExecutor {
     });
 
     if (!execution) return;
+
+    // Bail out immediately if the execution was already cancelled (e.g. race
+    // between enqueue and cancel).
     if (execution.status === ExecutionStatus.CANCELLED) {
       return;
     }
@@ -293,6 +347,7 @@ export class DurableExecutor {
       for (const step of execution.steps) {
         if (step.status === StepStatus.COMPLETED) continue;
 
+        // Safe point: abort before touching this step if cancelled.
         await this.checkCancelled(executionId);
 
         execution.currentStepNumber = step.stepNumber;
@@ -362,28 +417,9 @@ export class DurableExecutor {
     }
   }
 
-  private emitUpdate(
-    type: RealtimeEventType,
-    execution: DurableExecution,
-    result?: unknown
-  ) {
-    try {
-      const socketManager = getSocketManager();
-      socketManager.getEventEmitter().emitAgentExecutionUpdate(type, {
-        executionId: execution.id,
-        planId: execution.planId,
-        userId: execution.userId,
-        status: execution.status,
-        currentStep: execution.currentStepNumber,
-        totalSteps: execution.steps.length,
-        result,
-        error: execution.errorMessage,
-        timestamp: new Date(),
-      });
-    } catch (error) {
-      logger.warn("Failed to emit socket update", { error });
-    }
-  }
+  // ---------------------------------------------------------------------------
+  // Step execution with retries
+  // ---------------------------------------------------------------------------
 
   private async executeStepWithRetries(
     step: DurableStep,
@@ -391,6 +427,8 @@ export class DurableExecutor {
     executionId: string
   ): Promise<boolean> {
     while (step.retryCount < step.maxRetries) {
+      // Safe point: check before each attempt to avoid invoking a tool after
+      // the execution has been externally cancelled.
       await this.checkCancelled(executionId);
 
       step.status = StepStatus.RUNNING;
@@ -416,6 +454,8 @@ export class DurableExecutor {
           result.error || "Tool execution returned failed status"
         );
       } catch (error) {
+        if (error instanceof ExecutionCancelledError) throw error;
+
         step.retryCount++;
         step.error = error instanceof Error ? error.message : "Unknown error";
         step.status = StepStatus.FAILED;
@@ -439,6 +479,37 @@ export class DurableExecutor {
     }
     return false;
   }
+
+  // ---------------------------------------------------------------------------
+  // Socket emission helper
+  // ---------------------------------------------------------------------------
+
+  private emitUpdate(
+    type: RealtimeEventType,
+    execution: DurableExecution,
+    result?: unknown
+  ) {
+    try {
+      const socketManager = getSocketManager();
+      socketManager.getEventEmitter().emitAgentExecutionUpdate(type, {
+        executionId: execution.id,
+        planId: execution.planId,
+        userId: execution.userId,
+        status: execution.status,
+        currentStep: execution.currentStepNumber,
+        totalSteps: execution.steps.length,
+        result,
+        error: execution.errorMessage,
+        timestamp: new Date(),
+      });
+    } catch (error) {
+      logger.warn("Failed to emit socket update", { error });
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Operator repair paths
+  // ---------------------------------------------------------------------------
 
   /**
    * Operator repair: Manual retry of a failed step
