@@ -9,6 +9,7 @@ import { User } from "../Auth/user.entity";
 import UserService from "../Auth/user.service";
 import { stellarWebhookService } from "./webhook.service";
 import { platformWebhookService } from "./platformWebhook.service";
+import { webhookAuth } from "./middleware/webhookAuthMiddleware";
 import { SponsorshipTransactionBuilder } from "../../packages/sdk/src/sponsorship";
 import logger from "../config/logger";
 import authRoutes from "../Auth/auth.routes";
@@ -387,7 +388,7 @@ router.delete(
 // Public webhook endpoint for Stellar funding notifications
 router.post(
   "/webhook/stellar/funding",
-  verifyWebhookSignature,
+  webhookAuth("stellar"),
   async (req: Request, res: Response) => {
     try {
       const result = await stellarWebhookService.processFundingWebhook(req);
@@ -418,7 +419,7 @@ router.post(
 // Public webhook endpoint for Telegram
 router.post(
   "/webhook/telegram",
-  verifyWebhookSignature,
+  webhookAuth("telegram"),
   async (req: Request, res: Response) => {
     try {
       const result = await platformWebhookService.processTelegramWebhook(req);
@@ -456,7 +457,7 @@ router.post(
 // Public webhook endpoint for Discord
 router.post(
   "/webhook/discord",
-  verifyWebhookSignature,
+  webhookAuth("discord"),
   async (req: Request, res: Response) => {
     try {
       const result = await platformWebhookService.processDiscordWebhook(req);
