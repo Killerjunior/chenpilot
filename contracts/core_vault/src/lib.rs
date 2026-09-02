@@ -203,6 +203,12 @@ impl CoreVaultContract {
         if env.storage().instance().has(&DataKey::Admin) {
             fail(&env, FailureReason::AlreadyInitialized);
         }
+        // Reject hallucinated or non-contract addresses.
+        assert!(vault_token.as_contract().is_some(), "unresolved asset");
+        assert!(unified_auth.as_contract().is_some(), "unresolved authority");
+        // Verify the vault token is a valid token contract.
+        let token_client = token::Client::new(&env, &vault_token);
+        let _ = token_client.decimals();
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::VaultToken, &vault_token);
         env.storage().instance().set(&DataKey::UnifiedAuth, &unified_auth);

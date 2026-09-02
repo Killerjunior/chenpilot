@@ -11,6 +11,7 @@ pub enum DataKey {
     Admin,
     AiAgent(Address),
     VerifiedPool(BytesN<32>),
+    PoolMeta(BytesN<32>),
     CurrentStrategy,
     Votes(BytesN<32>),
     VotedPools,
@@ -61,7 +62,14 @@ pub struct EvtVote {
     pub actor: Address,
     pub ai_agent: Address,
     pub pool_id: BytesN<32>,
+    pub verified_ledger: u32,
     pub total_votes: u32,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct PoolInfo {
+    pub added_ledger: u32,
 }
 
 #[contract]
@@ -110,6 +118,7 @@ impl StrategyRegistryContract {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         env.storage().instance().set(&DataKey::VerifiedPool(pool_id.clone()), &true);
+        env.storage().instance().set(&DataKey::PoolMeta(pool_id.clone()), &PoolInfo { added_ledger: env.ledger().sequence() });
 
         env.events().publish(
             (symbol_short!("strat"), symbol_short!("pool_add")),
@@ -127,6 +136,7 @@ impl StrategyRegistryContract {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         env.storage().instance().remove(&DataKey::VerifiedPool(pool_id.clone()));
+        env.storage().instance().remove(&DataKey::PoolMeta(pool_id.clone()));
 
         env.events().publish(
             (symbol_short!("strat"), symbol_short!("pool_rm")),
@@ -144,6 +154,15 @@ impl StrategyRegistryContract {
         env.storage().instance().get(&DataKey::VerifiedPool(pool_id)).unwrap_or(false)
     }
 
+    /// Resolve a verified pool to its metadata. Panics if not verified.
+    pub fn resolve_pool(env: Env, pool_id: BytesN<32>) -> PoolInfo {
+        let verified: bool = env.storage().instance().get(&DataKey::VerifiedPool(pool_id.clone())).unwrap_or(false);
+        if !verified {
+            panic!("Pool is not verified");
+        }
+        env.storage().instance().get(&DataKey::PoolMeta(pool_id)).unwrap()
+    }
+
     /// Vote for a strategy (AI agent only, must be verified pool)
     pub fn vote_strategy(env: Env, ai_agent: Address, pool_id: BytesN<32>) {
         ai_agent.require_auth();
@@ -154,10 +173,8 @@ impl StrategyRegistryContract {
             panic!("AI agent not authorized");
         }
 
-        // Check if the pool is verified
-        if !Self::is_pool_verified(env.clone(), pool_id.clone()) {
-            panic!("Pool is not verified");
-        }
+        // Check if the pool is verified and resolve provenance
+        let pool_info = Self::resolve_pool(env.clone(), pool_id.clone());
 
         // Cast vote with TTL to decay old votes naturally
         let mut votes: u32 = env.storage().instance().get(&DataKey::Votes(pool_id.clone())).unwrap_or(0);
@@ -193,6 +210,7 @@ impl StrategyRegistryContract {
                 actor: ai_agent.clone(),
                 ai_agent,
                 pool_id,
+                verified_ledger: pool_info.added_ledger,
                 total_votes: votes,
             },
         );
