@@ -206,7 +206,13 @@ impl RbacContract {
     // Each asserts the caller holds the required role before proceeding.
 
     /// Only an OracleProvider may submit a price feed update.
-    pub fn submit_price(env: Env, caller: Address, price: i128) -> i128 {
+    ///
+    /// Security: Authorization is bound to the transaction source account
+    /// (`env.invoker()`) and to the exact contract, function, and arguments.
+    /// Nested invocation through other contracts cannot alter or replay this
+    /// authorization.
+    pub fn submit_price(env: Env, price: i128) -> i128 {
+        let caller = env.invoker();
         caller.require_auth();
         Self::assert_role(&env, &caller, Role::OracleProvider);
         // real logic would store the price; return it for testability
@@ -214,14 +220,22 @@ impl RbacContract {
     }
 
     /// Only an AgentOperator may trigger an agent task.
-    pub fn run_agent(env: Env, caller: Address, task_id: u32) -> u32 {
+    ///
+    /// Security: Same as [`submit_price`] — authorization is bound to the
+    /// transaction source account and to the exact arguments.
+    pub fn run_agent(env: Env, task_id: u32) -> u32 {
+        let caller = env.invoker();
         caller.require_auth();
         Self::assert_role(&env, &caller, Role::AgentOperator);
         task_id
     }
 
     /// Only an EmergencyAdmin may pause the system.
-    pub fn emergency_pause(env: Env, caller: Address) {
+    ///
+    /// Security: Same as [`submit_price`] — authorization is bound to the
+    /// transaction source account and to the exact arguments.
+    pub fn emergency_pause(env: Env) {
+        let caller = env.invoker();
         caller.require_auth();
         Self::assert_role(&env, &caller, Role::EmergencyAdmin);
         // real logic would flip a pause flag

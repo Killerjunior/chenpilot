@@ -99,6 +99,13 @@ impl StrategyRegistryContract {
     pub fn set_ai_agent(env: Env, ai_agent: Address, authorized: bool) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
+        // Trust assumption: This privileged call must come directly from the admin.
+        // Soroban's require_auth binds to this contract, function, and args, but does not
+        // restrict the immediate caller. Requiring the caller to be the admin prevents
+        // confused-deputy attacks via malicious intermediary contracts.
+        if env.caller() != admin {
+            panic!("caller is not admin");
+        }
         env.storage().instance().set(&DataKey::AiAgent(ai_agent.clone()), &authorized);
 
         env.events().publish(
@@ -117,6 +124,11 @@ impl StrategyRegistryContract {
     pub fn add_verified_pool(env: Env, pool_id: BytesN<32>) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
+        // Trust assumption: This privileged call must come directly from the admin.
+        // Prevents confused-deputy attacks via nested invocations.
+        if env.caller() != admin {
+            panic!("caller is not admin");
+        }
         env.storage().instance().set(&DataKey::VerifiedPool(pool_id.clone()), &true);
         env.storage().instance().set(&DataKey::PoolMeta(pool_id.clone()), &PoolInfo { added_ledger: env.ledger().sequence() });
 
@@ -135,6 +147,11 @@ impl StrategyRegistryContract {
     pub fn remove_verified_pool(env: Env, pool_id: BytesN<32>) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
+        // Trust assumption: This privileged call must come directly from the admin.
+        // Prevents confused-deputy attacks via nested invocations.
+        if env.caller() != admin {
+            panic!("caller is not admin");
+        }
         env.storage().instance().remove(&DataKey::VerifiedPool(pool_id.clone()));
         env.storage().instance().remove(&DataKey::PoolMeta(pool_id.clone()));
 
@@ -166,6 +183,11 @@ impl StrategyRegistryContract {
     /// Vote for a strategy (AI agent only, must be verified pool)
     pub fn vote_strategy(env: Env, ai_agent: Address, pool_id: BytesN<32>) {
         ai_agent.require_auth();
+        // Trust assumption: This privileged call must come directly from the AI agent.
+        // Prevents an intermediary contract from reusing the AI agent's authorization tree.
+        if env.caller() != ai_agent {
+            panic!("caller is not AI agent");
+        }
 
         // Check if the AI agent is authorized
         let is_authorized: bool = env.storage().instance().get(&DataKey::AiAgent(ai_agent.clone())).unwrap_or(false);

@@ -115,6 +115,13 @@ impl PoRValidatorContract {
         if env.storage().instance().has(&DataKey::Config) {
             panic!("Already initialized");
         }
+        // Authorization: only the admin themselves may initialize the contract.
+        // This binds the authorization to this exact contract and function,
+        // preventing an intermediary contract from setting a different admin.
+        if env.caller() != admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
         let config = Config {
             admin: admin.clone(),
             wbtc_token: wbtc_token.clone(),
@@ -141,6 +148,11 @@ impl PoRValidatorContract {
 
     pub fn update_config(env: Env, config: Config) {
         let current_config: Config = env.storage().instance().get(&DataKey::Config).expect("Not initialized");
+        // The current admin must authorize this call and must be the direct caller.
+        // This ensures no intermediary contract can reuse an authorization entry.
+        if env.caller() != current_config.admin {
+            panic!("Unauthorized");
+        }
         current_config.admin.require_auth();
         env.storage().instance().set(&DataKey::Config, &config);
 
@@ -159,6 +171,10 @@ impl PoRValidatorContract {
 
     pub fn set_safety_policy(env: Env, proof_cadence_ledgers: u32, max_stale_ledgers: u32) {
         let mut config: Config = env.storage().instance().get(&DataKey::Config).expect("Not initialized");
+        // Require direct admin caller and authorization for this exact call.
+        if env.caller() != config.admin {
+            panic!("Unauthorized");
+        }
         config.admin.require_auth();
         config.proof_cadence_ledgers = proof_cadence_ledgers;
         config.max_stale_ledgers = max_stale_ledgers;
@@ -177,6 +193,12 @@ impl PoRValidatorContract {
     }
 
     pub fn verify_reserves(env: Env) -> ProofRecord {
+        // Trust assumptions:
+        // - The configured `oracle` is trusted to return authentic reserve data.
+        // - `oracle` is only mutable by `admin` via `update_config`, which requires
+        //   direct admin authorization.
+        // - This function is public and intentionally does not require authorization;
+        //   it only reads oracle data and stores a proof.
         let config: Config = env.storage().instance().get(&DataKey::Config).expect("Not initialized");
         let current_ledger = env.ledger().sequence();
         let oracle_client = OracleClient::new(&env, &config.oracle);
@@ -204,7 +226,7 @@ impl PoRValidatorContract {
             EvtProof {
                 version: 1,
                 ledger: current_ledger,
-                actor: config.admin.clone(),
+                actor: env.caller(),
                 is_valid,
                 balance: reserve_data.balance,
                 circulating_supply: reserve_data.circulating_supply,
@@ -251,6 +273,75 @@ impl PoRValidatorContract {
 
     pub fn get_config(env: Env) -> Config {
         env.storage().instance().get(&DataKey::Config).expect("Not initialized")
+    }
+}
+
+#[cfg(test)]
+mod nested_auth_tests {
+    use super::*;
+    use soroban_sdk::{Env, Symbol, Address};
+    use soroban_sdk::testutils::Address as _;
+
+    #[test]
+    fn intermediary_cannot_initialize() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let intermediary = Address::generate(&env);
+
+        let contract_id = env.register_contract(None, PoRValidatorContract);
+
+        let init_args = (admin.clone(), token, oracle, 100u32);
+        let result = env.invoke_contract::<()>(
+            &contract_id,
+            &Symbol::new(&env, "initialize"),
+            &init_args,
+            &intermediary,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn intermediary_cannot_update_config() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let intermediary = Address::generate(&env);
+
+        let contract_id = env.register_contract(None, PoRValidatorContract);
+
+        // Initialize as admin (direct caller)
+        let init_args = (admin.clone(), token.clone(), oracle.clone(), 100u32);
+        let init_result = env.invoke_contract::<()>(
+            &contract_id,
+            &Symbol::new(&env, "initialize"),
+            &init_args,
+            &admin,
+        );
+        assert!(init_result.is_ok());
+
+        let malicious_config = Config {
+            admin: intermediary.clone(),
+            wbtc_token: token,
+            oracle,
+            tolerance_bps: 100,
+            proof_cadence_ledgers: 100,
+            max_stale_ledgers: 100,
+        };
+        let update_args = (malicious_config,);
+        let update_result = env.invoke_contract::<()>(
+            &contract_id,
+            &Symbol::new(&env, "update_config"),
+            &update_args,
+            &intermediary,
+        );
+        assert!(update_result.is_err());
     }
 }
 
