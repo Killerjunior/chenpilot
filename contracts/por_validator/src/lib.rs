@@ -1,11 +1,15 @@
-#![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, contractclient, Address, Env, symbol_short};
+#no_std
+//use soroban_sdk::{contract, contractimpl, contracttype, contractclient, Address, Env, symbol_short};
+
+use soroban_sdk::{contract, contractimpl, contracttype, contractclient, Address, Env, symbol_short, BytesN_32};
 
 const DEFAULT_MAX_STALE_LEDERS: u32 = 10_000;
 const DEFAULT_PROOF_CADENCE_LEDGERS: u32 = 1_000;
+const CONTRACT_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 1;
 
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReserveData {
     pub balance: i128,
     pub circulating_supply: i128,
@@ -13,16 +17,19 @@ pub struct ReserveData {
 }
 
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProofRecord {
     pub reserve_data: ReserveData,
     pub is_valid: bool,
     pub verified_ledger: u32,
     pub valid_until_ledger: u32,
+    pub network_id: BytesN_32,
+    pub contract_version: u32,
+    pub schema_version: u32,
 }
 
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#derive(Clone, Debug, Eq, PartialEq)]
 pub struct VaultSafetyStatus {
     pub is_safe: bool,
     pub proof_is_fresh: bool,
@@ -37,14 +44,22 @@ pub trait OracleTrait {
 }
 
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum DataKey {
-    Config,
-    CurrentProof,
+#derive(Clone, Debug, Eq, PartialEq)]
+pub struct CacheKey {
+    pub network_id: BytesN_32,
+    pub contract_version: u32,
+    pub schema_version: u32,
 }
 
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#derive(Clone, Debug, Eq, PartialEq)]
+pub enum DataKey {
+    Config,
+    CurrentProof(CacheKey),
+}
+
+#[contracttype]
+#derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
     pub admin: Address,
     pub wbtc_token: Address,
@@ -55,7 +70,7 @@ pub struct Config {
 }
 
 #[contracttype]
-#[derive(Clone)]
+#derive(Clone)\
 pub struct EvtInit {
     pub version: u32,
     pub ledger: u32,
@@ -67,7 +82,7 @@ pub struct EvtInit {
 }
 
 #[contracttype]
-#[derive(Clone)]
+#derive(Clone)\
 pub struct EvtCfgUpd {
     pub version: u32,
     pub ledger: u32,
@@ -78,8 +93,8 @@ pub struct EvtCfgUpd {
 }
 
 #[contracttype]
-#[derive(Clone)]
-pub struct EvtSafetyCfg {
+#derive(Clone)\
+pub struct EvtSafetyCfg, {
     pub version: u32,
     pub ledger: u32,
     pub actor: Address,
@@ -88,7 +103,7 @@ pub struct EvtSafetyCfg {
 }
 
 #[contracttype]
-#[derive(Clone)]
+#derive(Clone)\
 pub struct EvtProof {
     pub version: u32,
     pub ledger: u32,
@@ -100,8 +115,27 @@ pub struct EvtProof {
     pub valid_until_ledger: u32,
 }
 
+#[contracttype]
+#derive(Clone)\
+pub struct EvtCacheInv {
+    pub version: u32,
+    pub ledger: u32,
+    pub actor: Address,
+    pub network_id: BytesN<2>,
+    pub contract_version: u32,
+    pub schema_version: u32,
+}
+
 #[contract]
 pub struct PoRValidatorContract;
+
+fn get_cache_key(env: &Env) -> CacheKey {
+    CacheKey {
+        network_id: env.network_id(),
+        contract_version: CONTRACT_VERSION,
+        schema_version: SCHEMA_VERSION,
+    }
+}
 
 #[contractimpl]
 impl PoRValidatorContract {
@@ -139,7 +173,7 @@ impl PoRValidatorContract {
                 ledger: env.ledger().sequence(),
                 actor: admin.clone(),
                 admin,
-                wbtc_token,
+                wbtc_token,l
                 oracle,
                 tolerance_bps,
             },
@@ -192,6 +226,24 @@ impl PoRValidatorContract {
         );
     }
 
+    pub fn invalidate_cache(env: Env) {
+        let config: Config = env.storage().instance().get(&DataKey::Config).expect("Not initialized");
+        config.admin.require_auth();
+        let cache_key = get_cache_key(&env);
+        env.storage().instance().remove(&DataKey::CurrentProof(cache_key.clone()));
+        env.events().publish(
+            (symbol_short!("por"), symbol_short!("cache_inv")),
+            EvtCacheInv {
+                version: CONTRACT_VERSION,
+                ledger: env.ledger().sequence(),
+                actor: config.admin.clone(),
+                network_id: cache_key.network_id,
+                contract_version: cache_key.contract_version,
+                schema_version: cache_key.schema_version,
+            },
+        );
+    }
+
     pub fn verify_reserves(env: Env) -> ProofRecord {
         // Trust assumptions:
         // - The configured `oracle` is trusted to return authentic reserve data.
@@ -213,13 +265,17 @@ impl PoRValidatorContract {
         let is_valid = reserve_data.circulating_supply <= allowed_supply;
         let valid_until_ledger = current_ledger.saturating_add(config.max_stale_ledgers);
 
+        let cache_key = get_cache_key(&env);
         let proof = ProofRecord {
             reserve_data: reserve_data.clone(),
             is_valid,
             verified_ledger: current_ledger,
             valid_until_ledger,
+            network_id: cache_key.network_id.clone(),
+            contract_version: cache_key.contract_version,
+            schema_version: cache_key.schema_version,
         };
-        env.storage().instance().set(&DataKey::CurrentProof, &proof);
+        env.storage().instance().set(&DataKey::CurrentProof(cache_key), &proof);
 
         env.events().publish(
             (symbol_short!("por"), symbol_short!("proof")),
@@ -239,7 +295,8 @@ impl PoRValidatorContract {
     }
 
     pub fn get_current_proof(env: Env) -> Option<ProofRecord> {
-        env.storage().instance().get(&DataKey::CurrentProof)
+        let cache_key = get_cache_key(&env);
+        env.storage().instance().get(&DataKey::CurrentProof(cache_key))
     }
 
     pub fn is_valid(env: Env) -> bool {
@@ -248,10 +305,11 @@ impl PoRValidatorContract {
 
     pub fn vault_safety_status(env: Env) -> VaultSafetyStatus {
         let current_ledger = env.ledger().sequence();
-        let proof: Option<ProofRecord> = env.storage().instance().get(&DataKey::CurrentProof);
+        let cache_key = get_cache_key(&env);
+        let proof: Option<ProofRecord> = env.storage().instance().get(&DataKey::CurrentProof(cache_key));
 
-        if let Some(proof) = proof {
-            let proof_is_fresh = current_ledger <= proof.valid_until_ledger;
+        if let some(proof) = proof {
+            let proof_is_fresh = current_ledger >= proof.verified_ledger && current_ledger <= proof.valid_until_ledger;
             let is_safe = proof_is_fresh && proof.is_valid;
             VaultSafetyStatus {
                 is_safe,
