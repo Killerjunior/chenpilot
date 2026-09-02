@@ -16,6 +16,7 @@ import {
 } from "../Security";
 
 import { observabilityMiddleware, updateObservabilityContext } from "../observability";
+import { setTenantContext, setOptionalTenantContext } from "../Auth/tenantContext.middleware";
 
 import { authenticate } from "../Auth/auth";
 import UserService from "../Auth/user.service";
