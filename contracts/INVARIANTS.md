@@ -15,6 +15,7 @@ This document defines the invariants (safety properties) that must hold for each
 - [Intent Market Validator Invariants](#intent-market-validator-invariants)
 - [Lending Liquidation Invariants](#lending-liquidation-invariants)
 - [Liquidity Vault Invariants](#liquidity-vault-invariants)
+- [Oracle Aggregator Invariants](#oracle-aggregator-invariants)
 - [PoR Validator Invariants](#por-validator-invariants)
 - [Relayer Slashing Invariants](#relayer-slashing-invariants)
 - [Strategy Registry Invariants](#strategy-registry-invariants)
@@ -476,6 +477,80 @@ This document defines the invariants (safety properties) that must hold for each
 **Formal**: `amount_out >= min_amount_out`
 
 **Enforcement**: Slippage check on swap.
+
+---
+
+## Oracle Aggregator Invariants
+
+### OA1: Governance-Only Source Management
+**Invariant**: Sources can only be added, updated, or removed by admin.
+
+**Formal**: `add_source(...) | update_source(...) | remove_source(...) ⇒ caller == config.admin`
+
+**Enforcement**: `config.admin.require_auth()` on all three functions.
+
+### OA2: Weight Bounds
+**Invariant**: Every registered source has a weight in (0, 10000] bps.
+
+**Formal**: `0 < source.weight_bps <= 10000`
+
+**Enforcement**: Range check in `add_source` / `update_source`.
+
+### OA3: Source Count Bound
+**Invariant**: The registered source set never exceeds `MAX_SOURCES`.
+
+**Formal**: `source_list.len() <= MAX_SOURCES`
+
+**Enforcement**: Length check in `add_source` before registration.
+
+### OA4: Staleness Exclusion
+**Invariant**: A reading older than the staleness bound is never counted toward quorum or the median.
+
+**Formal**: `current_time > reading.timestamp + max_staleness_seconds ⇒ reading excluded`
+
+**Enforcement**: Freshness filter in `compute_aggregate`.
+
+### OA5: Quorum Before Median (Pass 1)
+**Invariant**: A median is only computed over a set that already meets both quorum thresholds.
+
+**Formal**: `fresh.count >= min_quorum_sources ∧ fresh.weight_bps >= min_quorum_weight_bps` before `weighted_median(fresh)` is called.
+
+**Enforcement**: `require(...)` checks in `compute_aggregate` precede the first `weighted_median` call.
+
+### OA6: Bounded Disagreement
+**Invariant**: Every source contributing to the final price is within `max_deviation_bps` of the preliminary median.
+
+**Formal**: `∀ r ∈ in_band: |r.price - prelim_median| / prelim_median <= max_deviation_bps / 10000`
+
+**Enforcement**: Deviation filter (pass 2) in `compute_aggregate`.
+
+### OA7: Quorum After Filtering (Pass 2)
+**Invariant**: If deviation filtering breaks quorum, the call fails instead of returning a price.
+
+**Formal**: `in_band.count < min_quorum_sources ∨ in_band.weight_bps < min_quorum_weight_bps ⇒ panic(ExcessiveSourceDisagreement)`
+
+**Enforcement**: `require(...)` checks in `compute_aggregate` after the deviation filter.
+
+### OA8: Fault-Isolated Source Reads
+**Invariant**: A single reverting/unreachable source cannot abort aggregation for the others.
+
+**Formal**: `source.get_price() panics ⇒ source excluded (sources_rejected_unavailable += 1), aggregation continues`
+
+**Enforcement**: `try_get_price()` (fallible cross-contract call) instead of `get_price()` in `compute_aggregate`.
+
+### OA9: Overflow-Safe Normalization
+**Invariant**: Decimal normalization never wraps or silently overflows.
+
+**Formal**: `normalize_checked(price, from, to)` uses `checked_mul` / `checked_div` / `checked_pow` throughout; any overflow panics with `ArithmeticError`.
+
+**Enforcement**: Checked arithmetic in `normalize_checked` / `checked_pow10`.
+
+### OA10: Degraded-Read Safety
+**Invariant**: A cached aggregate is only ever served if it is still within the staleness bound.
+
+**Formal**: `get_latest() ⇒ current_time <= last_aggregate.timestamp + max_staleness_seconds`, else panic.
+
+**Enforcement**: Freshness check in `get_latest`.
 
 ---
 
