@@ -1,3 +1,4 @@
+export * from "./canonical";
 export * from "./networkIntelligence";
 export * from "./errors";
 export * from "./errorRegistry";
