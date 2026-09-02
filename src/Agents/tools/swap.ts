@@ -3,6 +3,7 @@ import { ToolMetadata, ToolResult } from "../registry/ToolMetadata";
 import * as StellarSdk from "@stellar/stellar-sdk";
 import config from "../../config/config";
 import { accountSecretStore } from "../../Auth/accountSecretStore";
+import { SecretBuffer } from "../../utils/secretBuffer";
 import logger from "../../config/logger";
 import stellarPriceService from "../../services/stellarPrice.service";
 import { flashSwapRiskAnalyzer } from "../../services/flashSwapRiskAnalyzer";
@@ -89,7 +90,8 @@ export class SwapTool extends BaseTool<SwapPayload> {
   }
 
   /**
-   * Get a Stellar keypair for the user from stored account data
+   * Get a Stellar keypair for the user from stored account data.
+   * The secret key is wrapped in a SecretBuffer and zeroized after use.
    * @param userId - The user ID
    * @returns Stellar keypair
    * @throws Error if account not found
@@ -102,7 +104,12 @@ export class SwapTool extends BaseTool<SwapPayload> {
       throw new Error(`Stellar account not found for user: ${userId}`);
     }
 
-    return StellarSdk.Keypair.fromSecret(accountData.secretKey);
+    const secret = SecretBuffer.fromString(accountData.secretKey, `swap-key:${userId}`);
+    try {
+      return secret.consumeString((plainKey) => StellarSdk.Keypair.fromSecret(plainKey));
+    } finally {
+      secret.destroy();
+    }
   }
 
   /**
